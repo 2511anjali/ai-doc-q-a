@@ -1,12 +1,12 @@
 # main.py
-from fastapi.middleware.cors import CORSMiddleware
-
 from fastapi import FastAPI, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
 from pathlib import Path
 import uuid
 import json
 import re
-from typing import List
+import hashlib
+from typing import List, Optional
 
 import numpy as np
 import faiss
@@ -17,18 +17,23 @@ from pypdf import PdfReader
 import docx  # python-docx
 
 
+# -------------------------
+# App + CORS
+# -------------------------
 app = FastAPI(title="AI Document Q&A API")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:3000",
         "http://127.0.0.1:3000",
+        "http://localhost:5173",    # ✅ Vite
+        "http://127.0.0.1:5173",    # ✅ Vite
     ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 
 # -------------------------
 # Folders
@@ -42,9 +47,31 @@ for d in [UPLOAD_DIR, TEXT_DIR, CHUNK_DIR, INDEX_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
 # -------------------------
-# Embedding model (free)
+# Embedding model
 # -------------------------
 model = SentenceTransformer("all-MiniLM-L6-v2")
+
+
+# -------------------------
+# Helpers: normalize/dedupe
+# -------------------------
+STOP = {
+    "what", "is", "are", "the", "a", "an", "of", "to", "in", "and", "or", "for", "with",
+    "on", "about", "this", "that", "these", "those", "please", "tell", "me", "explain",
+    "give", "define", "discuss", "compare", "why", "how", "when", "where", "which"
+}
+
+def _norm(t: str) -> str:
+    t = t.lower()
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+def _hash_text(t: str) -> str:
+    return hashlib.md5(_norm(t).encode("utf-8")).hexdigest()
+
+def extract_keywords(question: str) -> List[str]:
+    words = [w for w in re.findall(r"[a-zA-Z]+", question.lower()) if len(w) > 2 and w not in STOP]
+    return words if words else re.findall(r"[a-zA-Z]+", question.lower())
 
 
 # -------------------------
@@ -59,11 +86,9 @@ def extract_text_from_pdf(path: Path) -> str:
             full_text += txt + "\n"
     return full_text.strip()
 
-
 def extract_text_from_docx(path: Path) -> str:
     d = docx.Document(str(path))
     return "\n".join([p.text for p in d.paragraphs if p.text.strip()]).strip()
-
 
 def extract_text_from_txt(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="ignore").strip()
@@ -86,16 +111,13 @@ def chunk_text(text: str, chunk_size: int = 900, overlap: int = 150) -> List[str
 
         if end == n:
             break
-
         start = max(0, end - overlap)
 
     return chunks
 
-
 def load_chunks(doc_id: str) -> List[str]:
     chunks_path = CHUNK_DIR / f"{doc_id}.json"
     return json.loads(chunks_path.read_text(encoding="utf-8"))
-
 
 def load_faiss_index(doc_id: str):
     index_path = INDEX_DIR / f"{doc_id}.faiss"
@@ -103,61 +125,128 @@ def load_faiss_index(doc_id: str):
 
 
 # -------------------------
-# Helpers: short bullet answer (no LLM)
+# Answer builders (no LLM)
 # -------------------------
-def is_question_line(line: str) -> bool:
-    line = line.strip()
-    return line.endswith("?") or line.lower().startswith(("what ", "why ", "how ", "define ", "explain ", "discuss ", "compare "))
+def is_summary_question(q: str) -> bool:
+    q = q.lower().strip()
+    patterns = [
+        "what is this document about",
+        "what does this document cover",
+        "what covers",
+        "summary",
+        "overview",
+        "document about",
+        "summarize",
+        "give summary",
+        "tell me about this document",
+    ]
+    return any(p in q for p in patterns)
 
-def cleanup_line(line: str) -> str:
-    return re.sub(r"\s+", " ", line).strip()
+def sentence_level_answer(question: str, contexts: List[str], max_points: int = 5) -> str:
+    q_words = extract_keywords(question)
+    scored = []
 
-def make_bulleted_answer(question: str, chunks: List[str], max_points: int = 5) -> str:
-    # Collect candidate lines from retrieved chunks
+    for ctx in contexts:
+        # split into sentences
+        sents = re.split(r"(?<=[.!?])\s+", ctx.strip())
+        for s in sents:
+            s = s.strip()
+            if len(s) < 25:
+                continue
+            s_low = s.lower()
+
+            score = sum(1 for w in q_words if w in s_low)
+
+            # small bonus if it looks like a definition / structured answer
+            if ":" in s[:50]:
+                score += 1
+
+            if score > 0:
+                scored.append((score, s))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    picked = []
+    seen = set()
+    for score, s in scored:
+        key = _norm(s)
+        if key in seen:
+            continue
+        seen.add(key)
+        picked.append(s)
+        if len(picked) >= max_points:
+            break
+
+    if not picked:
+        return (
+            "I couldn’t find a direct answer for this question in the document.\n"
+            "Try asking with more specific keywords (topic/heading/term)."
+        )
+
+    return "• " + "\n• ".join(picked)
+
+def summarize_document(contexts: List[str], max_points: int = 5) -> str:
+    # Grab clean lines from the most relevant chunks
     lines = []
-    for c in chunks:
-        for line in c.split("\n"):
-            line = cleanup_line(line)
-            if 25 <= len(line) <= 200:
-                lines.append(line)
+    for ctx in contexts[:8]:
+        for ln in ctx.splitlines():
+            ln = ln.strip()
+            if 10 <= len(ln) <= 120:
+                lines.append(ln)
 
-    if not lines:
-        return "No relevant text found in the indexed chunks."
+    # dedupe lines
+    uniq = []
+    seen = set()
+    for ln in lines:
+        key = _norm(ln)
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(ln)
 
-    # Prefer statement-like lines (not ending with '?')
-    statements = [l for l in lines if not is_question_line(l)]
-    questions = [l for l in lines if is_question_line(l)]
+    if not uniq:
+        return "This document has multiple sections. Ask a specific topic/heading for a precise answer."
 
-    # keyword scoring
-    keywords = [w.lower() for w in re.findall(r"[a-zA-Z]{4,}", question)]
-    keywords = list(set(keywords))
+    # Keep top bullets
+    return "• " + "\n• ".join(uniq[:max_points])
 
-    def score_line(l: str) -> int:
-        ll = l.lower()
-        return sum(1 for k in keywords if k in ll)
+def diversify_contexts(question: str, contexts: List[str], max_keep: int) -> List[str]:
+    # Prefer chunks containing more question keywords; avoid duplicates
+    q_words = extract_keywords(question)
+    ranked = []
 
-    # Score statements first
-    scored_statements = sorted([(score_line(l), l) for l in statements], reverse=True, key=lambda x: x[0])
-    best = [l for s, l in scored_statements if s > 0][:max_points]
+    for txt in contexts:
+        t_low = txt.lower()
+        score = sum(1 for w in q_words if w in t_low)
+        ranked.append((score, txt))
 
-    # If no good statements found, fall back to questions but present as "topics"
-    if not best:
-        scored_questions = sorted([(score_line(l), l) for l in questions], reverse=True, key=lambda x: x[0])
-        top_q = [l for s, l in scored_questions if s > 0][:max_points]
+    ranked.sort(key=lambda x: x[0], reverse=True)
 
-        if not top_q:
-            top_q = questions[:max_points]
+    out = []
+    seen = set()
+    for score, txt in ranked:
+        h = _hash_text(txt)
+        if h in seen:
+            continue
+        seen.add(h)
+        out.append(txt)
+        if len(out) >= max_keep:
+            break
 
-        # Convert Q-style into topic bullets
-        topic_bullets = []
-        for q in top_q:
-            q = q.rstrip("?").strip()
-            # make it look like a topic
-            topic_bullets.append(f"- Topic: {q}")
-        return "This document mainly covers:\n" + "\n".join(topic_bullets)
+    # fallback: if all scores 0, just take unique first max_keep
+    if not out and contexts:
+        out = []
+        seen = set()
+        for txt in contexts:
+            h = _hash_text(txt)
+            if h in seen:
+                continue
+            seen.add(h)
+            out.append(txt)
+            if len(out) >= max_keep:
+                break
 
-    return "\n".join([f"- {b}" for b in best])
-
+    return out
 
 
 # -------------------------
@@ -166,7 +255,7 @@ def make_bulleted_answer(question: str, chunks: List[str], max_points: int = 5) 
 class AskRequest(BaseModel):
     doc_id: str
     question: str
-    top_k: int = 3
+    top_k: int = 6  # ✅ better default than 3
 
 
 # -------------------------
@@ -175,6 +264,7 @@ class AskRequest(BaseModel):
 @app.get("/health")
 def health_check():
     return {"status": "ok"}
+
 
 def build_index_for_doc(doc_id: str) -> dict:
     text_path = TEXT_DIR / f"{doc_id}.txt"
@@ -197,12 +287,14 @@ def build_index_for_doc(doc_id: str) -> dict:
 
     embeddings = model.encode(chunks, convert_to_numpy=True, show_progress_bar=False).astype("float32")
     dim = embeddings.shape[1]
+
+    # L2 index (works fine; for even better, you can normalize embeddings and use cosine)
     index = faiss.IndexFlatL2(dim)
     index.add(embeddings)
 
     faiss.write_index(index, str(INDEX_DIR / f"{doc_id}.faiss"))
-
     return {"ok": True, "chunks": len(chunks), "embedding_dim": int(dim)}
+
 
 @app.post("/upload")
 async def upload_document(file: UploadFile = File(...)):
@@ -230,62 +322,39 @@ async def upload_document(file: UploadFile = File(...)):
     # Save extracted text
     text_path = TEXT_DIR / f"{doc_id}.txt"
     text_path.write_text(extracted, encoding="utf-8")
+
+    # Build index immediately
     index_info = build_index_for_doc(doc_id)
 
-
-
     return {
-    "message": "uploaded, extracted, and indexed",
-    "doc_id": doc_id,
-    "file_type": ext.replace(".", ""),
-    "text_length": len(extracted),
-    "indexed": index_info.get("ok", False),
-    "chunks": index_info.get("chunks"),
-    "embedding_dim": index_info.get("embedding_dim"),
-    "index_error": index_info.get("error"),
-}
-
+        "message": "uploaded, extracted, and indexed",
+        "doc_id": doc_id,
+        "file_type": ext.replace(".", ""),
+        "text_length": len(extracted),
+        "indexed": index_info.get("ok", False),
+        "chunks": index_info.get("chunks"),
+        "embedding_dim": index_info.get("embedding_dim"),
+        "index_error": index_info.get("error"),
+    }
 
 
 @app.post("/index/{doc_id}")
 def index_document(doc_id: str):
+    # optional manual re-index
     doc_id = doc_id.strip()
     text_path = TEXT_DIR / f"{doc_id}.txt"
     if not text_path.exists():
         return {"error": "Text file not found for this doc_id. Upload first."}
 
-    text = text_path.read_text(encoding="utf-8", errors="ignore")
-    if not text.strip():
-        return {"error": "Extracted text is empty. Try another document."}
-
-    # 1) Chunking
-    chunks = chunk_text(text)
-    if not chunks:
-        return {"error": "No chunks created from text."}
-
-    # Save chunks
-    chunks_path = CHUNK_DIR / f"{doc_id}.json"
-    chunks_path.write_text(json.dumps(chunks, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    # 2) Embeddings
-    embeddings = model.encode(chunks, convert_to_numpy=True, show_progress_bar=False).astype("float32")
-    if embeddings.ndim != 2:
-        return {"error": "Embedding generation failed."}
-
-    # 3) FAISS index
-    dim = embeddings.shape[1]
-    index = faiss.IndexFlatL2(dim)
-    index.add(embeddings)
-
-    # Save index
-    index_path = INDEX_DIR / f"{doc_id}.faiss"
-    faiss.write_index(index, str(index_path))
+    index_info = build_index_for_doc(doc_id)
+    if not index_info.get("ok"):
+        return {"error": index_info.get("error", "Indexing failed")}
 
     return {
         "message": "indexed successfully",
         "doc_id": doc_id,
-        "chunks": len(chunks),
-        "embedding_dim": int(dim),
+        "chunks": index_info.get("chunks"),
+        "embedding_dim": index_info.get("embedding_dim"),
     }
 
 
@@ -297,10 +366,9 @@ def ask_question(payload: AskRequest):
 
     chunks_path = CHUNK_DIR / f"{doc_id}.json"
     index_path = INDEX_DIR / f"{doc_id}.faiss"
- 
-    
+
     if not chunks_path.exists() or not index_path.exists():
-        return {"error": "Index not found. Please call /index/{doc_id} first."}
+        return {"error": "Index not found. Please upload again or call /index/{doc_id} first."}
 
     chunks = load_chunks(doc_id)
     index = load_faiss_index(doc_id)
@@ -308,35 +376,52 @@ def ask_question(payload: AskRequest):
     # Embed question
     q_emb = model.encode([question], convert_to_numpy=True).astype("float32")
 
-    # Search
-    distances, indices = index.search(q_emb, top_k)
+    # ✅ Fetch more than top_k, then dedupe + diversify
+    fetch_k = min(max(top_k * 4, top_k), 20)
+    distances, indices = index.search(q_emb, fetch_k)
 
     results = []
-    context_parts = []
+    raw_contexts = []
+    seen_hashes = set()
 
     for rank, idx in enumerate(indices[0]):
         if idx == -1:
             continue
+
         chunk_text_value = chunks[int(idx)]
+        h = _hash_text(chunk_text_value)
+
+        # ✅ DEDUPE repeated chunks (reduces repeated answers)
+        if h in seen_hashes:
+            continue
+        seen_hashes.add(h)
 
         preview = (chunk_text_value[:300] + "...") if len(chunk_text_value) > 300 else chunk_text_value
 
-        results.append(
-            {
-                "rank": rank + 1,
-                "chunk_index": int(idx),
-                "distance": float(distances[0][rank]),
-                "text": preview,
-            }
-        )
-        context_parts.append(chunk_text_value)
+        results.append({
+            "rank": len(results) + 1,
+            "chunk_index": int(idx),
+            "distance": float(distances[0][rank]),
+            "text": preview,
+        })
 
-    # Build a clean answer (no paid LLM)
-    answer = make_bulleted_answer(question, context_parts, max_points=5)
+        raw_contexts.append(chunk_text_value)
+
+        if len(raw_contexts) >= fetch_k:
+            break
+
+    # ✅ Choose diversified contexts
+    context_parts = diversify_contexts(question, raw_contexts, max_keep=top_k)
+
+    # ✅ Route summary vs direct answer
+    if is_summary_question(question):
+        answer = summarize_document(context_parts, max_points=5)
+    else:
+        answer = sentence_level_answer(question, context_parts, max_points=5)
 
     return {
         "doc_id": doc_id,
         "question": question,
         "answer": answer,
-        "sources": results,
+        "sources": results[:top_k],
     }

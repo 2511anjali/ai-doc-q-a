@@ -2,6 +2,7 @@ import "../App.css";
 import himanshuImg from "../assets/team/Himanshu.jpeg";
 import anjaliImg from "../assets/team/AnjaliImage.jpeg";
 import manthanImg from "../assets/team/ManthanImage.jpeg";
+import kirtiImg from "../assets/team/KirtiImage.jpeg";
 export default function AboutPage() {
   const team = [
     { name: "Anjali Chauhan", role: "Backend Developer", initials: "AC" },
@@ -58,7 +59,9 @@ export default function AboutPage() {
     </div>
 
     <div className="member-card">
-      <div className="member-avatar">KP</div>
+     <div className="member-image">
+         <img src={kirtiImg} alt="KP" />
+      </div>
       <h3>Kirti Pathak</h3>
       <p>Project Manager</p>
     </div>

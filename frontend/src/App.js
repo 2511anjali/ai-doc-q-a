@@ -254,7 +254,9 @@ const handleAsk = async () => {
       ) : (
         <>
           <div className="msg-bubble">
-  <div className="msg-text">{m.text}</div>
+  <div className="msg-text" style={{ whiteSpace: "pre-wrap" }}>
+  {m.text}
+</div>
 </div>
 
         </>
